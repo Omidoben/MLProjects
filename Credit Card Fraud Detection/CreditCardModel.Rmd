@@ -1,0 +1,313 @@
+---
+title: "Credit Card Fraud Detection"
+output: html_document
+date: "2024-09-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+```
+
+This project entails building a Machine Learning model to detect fraudlent transactions. It utilizes the credit card data set sourced from Kaggle.
+
+```{r}
+creditCard <- read_csv("creditcard.csv")
+
+glimpse(creditCard)
+```
+
+**Data Description**
+
+* The dataset contains 31 columns and 284, 807 rows
+* The rows represent the transactions made by European cardholders in September 2013.
+
+**_Features:_**
+
+* **Time:** Seconds elapsed between each transaction and the first transaction.
+* **Amount:** Transaction amount
+* 28 numerical variables resulting from PCA transformation
+
+* **Class:** It is the Target Variable (Predictor Variable), contains 1 for fraudlent transactions and 0 otherwise
+
+#### **Exploring the data**
+
+```{r}
+creditCard %>% 
+  count(Class) %>% 
+  mutate(percentage = round(n / sum(n) * 100, 2))
+```
+
+The data is highly imbalanced. There are 284,315 (99.8%) non - fraudlent transactions and only 492 (0.17%) fraudlent transactions.  
+
+Credit card fraud datasets, including this one, are typically highly imbalanced because occurrences of fraud are rare compared to normal transactions.
+
+*In the next sections, we explore effective strategies for handling this imbalance.*
+
+**Correlation**   
+
+I calculated the correlation coefficients between the Class variable (predictor) and the other continuous variables  
+
+The correlation tells us how changes in the continuous variables are associated with the binary outcome (fraud or non-fraud).  
+
+For example, a positive correlation between Class and a continuous variable indicates that as the continuous variable increases, the probability of Class being 1 (fraud) also increases.
+
+```{r}
+corr <- cor(creditCard[, 1:30], creditCard$Class)
+corr
+```
+
+```{r fig.width=10}
+# Correlation plot - using a bar chart
+
+corr_df <- tibble(Variable = rownames(corr), Correlation = corr[, 1])
+
+ggplot(corr_df, aes(x = Variable, y = Correlation, fill = Correlation > 0)) +
+  geom_col() +
+  labs(title = "Correlation with Class", x = "Variables", y = "Correlation") +
+  theme_minimal()
+```
+
+Majority of the features have weak correlation with the Class variable
+
+#### **Model Building**
+
+Three classification models were developed to detect credit card fraud: Logistic Regression, Random Forest, and XGBoost. The process involved fitting, tuning, and evaluating each model to identify the best-performing one for the highly imbalanced dataset.
+
+**Data Splitting**
+
+```{r}
+# The data was split into train and test sets using stratified sampling based on the Class variable
+
+creditCard <- creditCard %>% 
+  mutate(Class = as.factor(Class)) %>% 
+  select(-Time)
+
+set.seed(0231)
+df_split <- initial_split(creditCard, strata = Class, prop = 0.75)
+df_train <- training(df_split)
+df_test <- testing(df_split)
+
+df_train
+df_test
+```
+
+
+**Data Preprocessing (Recipe)**
+
+The data is highly imbalanced. Using the data set as it is may lead to poor performance in detecting one class.  
+
+The overwhelming majority of records belong to the non-fraudulent class (class 0), making up over 99% of the dataset.  
+
+Models trained on imbalanced data may prioritize accuracy on the majority class while neglecting the minority class (fraudulent transactions). This can result in poor performance in detecting fraud. Thus, we use resampling techniques such as SMOTE and Downsampling to overcome this challenge:
+
+
+1) Oversampling techniques like SMOTE (Synthetic Minority Over-sampling Technique) artificially inflates the minority class by generating synthetic examples. However, this can lead to overfitting and the introduction of noise, especially in cases where the minority class is already sparsely represented.  
+
+
+2) Downsampling involves randomly reducing the number of samples in the majority class to balance it with the minority class. This approach helps mitigate the biases towards the majority class while maintaining the integrity of the dataset. By reducing the number of majority class samples to match the minority class, downsampling encourages the model to learn from both classes equally, improving its ability to accurately detect fraudulent transactions.
+
+**_Due to the huge data set and computational challenges, this project utilizes the downsampling resampling technique only_**
+
+```{r}
+library(themis)
+
+df_recipe <- recipe(Class ~ ., data = df_train) %>% 
+  step_downsample(Class, under_ratio = 1) %>%   # under_ratio = 1 is the default
+  step_normalize(all_predictors())
+
+prep(df_recipe) %>% bake(new_data = NULL)
+```
+
+**Model Specification**
+
+```{r}
+# logistic model
+
+logistic_spec <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification")
+
+
+# Random forest model
+
+rf_spec <- 
+  rand_forest(trees = 1000, min_n = tune(), mtry = tune()) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+# xgboost model
+
+xgb_spec <- 
+  boost_tree(trees = 1000, mtry = tune(), min_n = tune(), learn_rate = tune(), 
+             loss_reduction = tune(), sample_size = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+```
+
+**Workflow set**
+
+```{r}
+df_wfs <- 
+  workflow_set(preproc = list(rec = df_recipe),
+               models = list(logistic = logistic_spec,
+                             rf = rf_spec,
+                             xgb = xgb_spec))
+
+df_wfs
+
+df_wfs <- df_wfs %>% 
+  mutate(wflow_id = str_replace_all(wflow_id, "rec_", ""))
+```
+
+**Model Tuning**
+
+```{r}
+# Resample folds
+
+set.seed(3287)
+df_folds <- vfold_cv(df_train, strata = Class)
+df_folds
+
+library(finetune)
+
+doParallel::registerDoParallel()
+
+ctrl = control_race(save_pred = TRUE,
+                    verbose_elim = TRUE)
+
+ctrl
+
+df_race <- df_wfs %>% 
+  workflow_map(
+    "tune_race_anova",
+    seed = 1234,
+    resamples = df_folds,
+    grid = 15,   # # Evaluate 15 different hyperparameter combinations
+    control = ctrl
+  )
+
+df_race
+```
+
+**Model Selection**
+
+```{r}
+df_race %>% collect_metrics()
+
+df_race %>% rank_results() %>% 
+  filter(.metric == "roc_auc")
+
+# Plot
+autoplot(df_race,
+         rank_metric = "roc_auc",
+         metric = "roc_auc",
+         select_best = TRUE) +
+  ggrepel::geom_text_repel(aes(label = wflow_id), nudge_x = 0.1, nudge_y = 1/600) +
+  theme(legend.position = "none")
+```
+
+From above plot, XGBoost is the best performing model, it has an roc_auc = 0.977
+
+```{r}
+# Extract the best results and fit the final model
+
+best_results <- df_race %>% 
+  extract_workflow_set_result("xgb") %>% 
+  select_best(metric = "roc_auc")
+
+best_results
+
+df_fit <- df_race %>% 
+  extract_workflow("xgb") %>% 
+  finalize_workflow(best_results) %>% 
+  last_fit(df_split)
+
+df_fit
+```
+
+**Model Evaluation**
+
+```{r}
+df_fit %>% collect_metrics()
+
+# Confusion matrix
+
+df_fit %>% 
+  collect_predictions() %>% 
+  conf_mat(Class, .pred_class)
+```
+
+True Positives (TP): The model correctly predicted 94 cases as fraud when they were actually fraud  
+
+True Negatives (TN): The model correctly predicted 69898 cases as non-fraudlent when they were actually non-fraudlent  
+
+False Positives (FP): The model falsely predicted 1119 cases as fraud, but the actual value is 0 (non-fraud)  
+
+False Negatives (FN): The model falsely predicted 11 cases as non-fraudlent, but the actual value is 1 (fraud)  
+
+
+```{r}
+# Performance metrics
+
+df_fit %>% 
+  collect_predictions() %>% 
+  conf_mat(Class, .pred_class) %>% summary()
+```
+
+* Sensitivity (or recall) of 0.98 means that the model correctly identified 98% of the non-fraudulent transactions (Class 0).
+  *  This shows the model is highly capable of identifying non-fraudulent cases.
+
+* Specificity of 0.89 means that the model correctly identified 90.5% of the fraudulent transactions (Class 1).
+
+* Positive Predictive Value (PPV) of 0.99 means that when the model predicted a transaction as non-fraudulent, it was correct 99% of the time.
+
+* Negative Predictive Value (NPV) of 0.072 means that when the model predicted a transaction as fraudulent, it was correct only 7.2% of the time.
+
+  * This is quite poor and suggests the model struggles to make accurate predictions for fraud cases (many false negatives).
+
+* This metric refers to precision for Class 0 (non-fraud). A perfect score of 1.00 means the model correctly classified all non-fraud predictions without any false positives.
+
+*Overall Interpretation*
+
+* The model is extremely accurate at predicting non-fraudulent transactions, with perfect precision (0.99) and near-perfect recall (0.98). 
+* However, this is largely due to the imbalanced nature of the data, where non-fraudulent transactions dominate.
+
+* Despite the high sensitivity and specificity, the negative predictive value (NPV) of 7.2% shows that when the model predicts fraud, it is rarely correct.  
+
+* This indicates that the model struggles with detecting actual fraudulent cases, leading to many false negatives (cases where fraud is missed).
+
+**Variable Importance**
+
+```{r}
+library(vip)
+
+df_fit %>% 
+  extract_fit_engine() %>% 
+  vip()
+
+
+extract_fit_engine(df_fit) %>% 
+  vi() %>% 
+  slice_max(Importance, n = 15) %>% 
+  ggplot(aes(fct_reorder(Variable, Importance), Importance, fill = "midnightblue")) +
+  geom_col() +
+  coord_flip() +
+  labs(y = "Importance", x = NULL, title = "Variable Importance") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(color = "black"))
+```
+
+
+The most important variables in the model were V14, V10, and V4, which significantly influenced its ability to detect fraudulent transactions. These features contributed the most to the model's performance, enhancing its accuracy and detection capabilities.  
+
+
+Since fraud detection models are more concerned with identifying fraud cases correctly, focusing on reducing false negatives - fraudulent transactions classified as non-fraudulent (improving NPV and specificity) is advised.
+
+
+
+
+
